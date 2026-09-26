@@ -2,17 +2,25 @@ import shutil
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.test import TestCase
 from django.test import override_settings
+from pikepdf import Name
+from pikepdf import Pdf
 from rest_framework import status
 from rest_framework.test import APIClient
 
 from documents import tasks
 from documents.barcodes import BarcodePlugin
+from documents.barcodes import LocatedBarcode
+from documents.barcodes import add_barcode_links
+from documents.barcodes import attach_barcode_rects
+from documents.barcodes import is_link_url
+from documents.barcodes import locate_barcodes
 from documents.consumer import ConsumerError
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
@@ -22,6 +30,7 @@ from documents.models import Tag
 from documents.plugins.base import StopConsumeTaskError
 from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import SampleDirMixin
+from paperless.config import BarcodeConfig
 from paperless.models import ApplicationConfiguration
 from paperless_testing.assertions import FileSystemAssertsMixin
 from paperless_testing.dirs import DirectoriesMixin
@@ -1132,6 +1141,346 @@ class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
             self.assertEqual(len(document_list), 3)
 
 
+class TestBarcodeLinks(
+    DirectoriesMixin,
+    SampleDirMixin,
+    GetReaderPluginMixin,
+    TestCase,
+):
+    # Area of the pasted QR image on page 2 of barcode-qr-url.pdf, in PDF points
+    QR_AREA = (403.2, 73.9, 547.2, 217.9)
+
+    def _link_annotations(self, pdf_path: Path, page: int) -> list:
+        with Pdf.open(pdf_path) as pdf:
+            annots = pdf.pages[page].obj.get("/Annots", [])
+            return [
+                (str(a.A.URI), [float(x) for x in a.Rect], int(a.F))
+                for a in annots
+                if a.Subtype == Name.Link
+            ]
+
+    def _assert_over_qr(self, rect: list[float]) -> None:
+        x0, y0, x1, y1 = self.QR_AREA
+        self.assertGreaterEqual(rect[0], x0)
+        self.assertGreaterEqual(rect[1], y0)
+        self.assertLessEqual(rect[2], x1)
+        self.assertLessEqual(rect[3], y1)
+        # covers most of the code, not just a corner
+        self.assertGreater(rect[2] - rect[0], 100)
+        self.assertGreater(rect[3] - rect[1], 100)
+
+    def test_is_link_url(self) -> None:
+        """
+        GIVEN:
+            - Barcode values with various schemes
+        WHEN:
+            - Checked for being a link
+        THEN:
+            - Only absolute http(s) URLs are links
+        """
+        for value in (
+            "https://example.com/a?b=c",
+            "http://example.com",
+            " https://example.com ",
+        ):
+            self.assertTrue(is_link_url(value), value)
+        for value in (
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:someone@example.com",
+            "https://",
+            "example.com",
+            "ASN00123",
+            "",
+        ):
+            self.assertFalse(is_link_url(value), value)
+
+    @override_settings(CONSUMER_ENABLE_BARCODE_LINKS=True)
+    def test_link_pages_detected(self) -> None:
+        """
+        GIVEN:
+            - PDF with a javascript: QR code on page 1 and a URL QR code on page 2
+            - Barcode links enabled
+        WHEN:
+            - The barcode plugin runs
+        THEN:
+            - Only page 2 is remembered for linking
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+
+        with self.get_reader(test_file) as reader:
+            self.assertTrue(reader.able_to_run)
+            reader.run()
+            self.assertEqual(reader.metadata.barcode_link_pages, [1])
+
+    def test_link_pages_disabled(self) -> None:
+        """
+        GIVEN:
+            - PDF with a URL QR code
+            - Barcode links not enabled
+        WHEN:
+            - The barcode plugin runs
+        THEN:
+            - No pages are remembered for linking
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+
+        with self.get_reader(test_file) as reader:
+            self.assertFalse(reader.able_to_run)
+            reader.run()
+            self.assertIsNone(reader.metadata.barcode_link_pages)
+
+    def test_link_pages_from_app_config(self) -> None:
+        """
+        GIVEN:
+            - Barcode links enabled in the application configuration only
+        WHEN:
+            - The barcode plugin checks whether it can run
+        THEN:
+            - It runs
+        """
+        app_config = ApplicationConfiguration.objects.first()
+        app_config.barcode_enable_links = True
+        app_config.save()
+
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+        with self.get_reader(test_file) as reader:
+            self.assertTrue(reader.able_to_run)
+
+    def test_add_links(self) -> None:
+        """
+        GIVEN:
+            - PDF with a javascript: QR code on page 1 and a URL QR code on page 2
+        WHEN:
+            - Links are added to all pages
+        THEN:
+            - One printable link to the URL covers the QR code on page 2
+            - The javascript: code is not linked
+        """
+        test_file = self.dirs.scratch_dir / "barcode-qr-url.pdf"
+        shutil.copy(self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf", test_file)
+
+        count = add_barcode_links(
+            test_file,
+            None,
+            BarcodeConfig(),
+            self.dirs.scratch_dir,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(self._link_annotations(test_file, 0), [])
+        links = self._link_annotations(test_file, 1)
+        self.assertEqual(len(links), 1)
+        uri, rect, flags = links[0]
+        self.assertEqual(uri, "https://example.com/invoice/4711")
+        self.assertEqual(flags, 4)
+        self._assert_over_qr(rect)
+
+    def test_add_links_rotated_pages(self) -> None:
+        """
+        GIVEN:
+            - The same page, displayed with each possible /Rotate value
+        WHEN:
+            - Links are added
+        THEN:
+            - The link always covers the QR code, as it is the same content
+        """
+        for rotate in (90, 180, 270):
+            with self.subTest(rotate=rotate):
+                test_file = self.dirs.scratch_dir / f"rotated-{rotate}.pdf"
+                with Pdf.open(self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf") as pdf:
+                    pdf.pages[1].obj.Rotate = rotate
+                    pdf.save(test_file)
+
+                count = add_barcode_links(
+                    test_file,
+                    [1],
+                    BarcodeConfig(),
+                    self.dirs.scratch_dir,
+                )
+
+                self.assertEqual(count, 1)
+                self._assert_over_qr(self._link_annotations(test_file, 1)[0][1])
+
+    def test_add_links_only_given_pages(self) -> None:
+        """
+        GIVEN:
+            - PDF with a URL QR code on page 2
+        WHEN:
+            - Links are added for page 1 only, or for a page that does not exist
+        THEN:
+            - Nothing is linked and the file is unchanged
+        """
+        test_file = self.dirs.scratch_dir / "barcode-qr-url.pdf"
+        shutil.copy(self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf", test_file)
+        before = test_file.read_bytes()
+
+        self.assertEqual(
+            add_barcode_links(
+                test_file,
+                [0, 5],
+                BarcodeConfig(),
+                self.dirs.scratch_dir,
+            ),
+            0,
+        )
+        self.assertEqual(test_file.read_bytes(), before)
+
+    def test_add_links_no_url_barcodes(self) -> None:
+        """
+        GIVEN:
+            - PDF with barcodes that are not URLs
+        WHEN:
+            - Links are added
+        THEN:
+            - Nothing is linked
+        """
+        test_file = self.dirs.scratch_dir / "patch-code-t-qr.pdf"
+        shutil.copy(self.BARCODE_SAMPLE_DIR / "patch-code-t-qr.pdf", test_file)
+
+        self.assertEqual(
+            add_barcode_links(test_file, None, BarcodeConfig(), self.dirs.scratch_dir),
+            0,
+        )
+
+    @override_settings(
+        CONSUMER_ENABLE_BARCODE_LINKS=True,
+        CELERY_TASK_ALWAYS_EAGER=True,
+        OCR_MODE="auto",
+    )
+    @pytest.mark.usefixtures("fake_progress_manager")
+    def test_consume_file_links_archive(self) -> None:
+        """
+        GIVEN:
+            - PDF with a URL QR code on page 2
+            - Barcode links enabled
+        WHEN:
+            - File is consumed, then reprocessed
+        THEN:
+            - The archive file links the QR code
+            - The original file is unchanged
+            - The link is placed again after reprocessing
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+        dst = settings.SCRATCH_DIR / "barcode-qr-url.pdf"
+        shutil.copy(test_file, dst)
+
+        tasks.consume_file(
+            ConsumableDocument(
+                source=DocumentSource.ConsumeFolder,
+                original_file=dst,
+            ),
+            None,
+        )
+
+        document = Document.objects.get()
+        self.assertTrue(document.has_archive_version)
+        links = self._link_annotations(document.archive_path, 1)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0][0], "https://example.com/invoice/4711")
+        self.assertEqual(self._link_annotations(document.source_path, 1), [])
+        self.assertEqual(document.source_path.read_bytes(), test_file.read_bytes())
+
+        tasks.update_document_content_maybe_archive_file(document.pk)
+
+        document.refresh_from_db()
+        links = self._link_annotations(document.archive_path, 1)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0][0], "https://example.com/invoice/4711")
+
+    @override_settings(
+        CONSUMER_ENABLE_BARCODE_LINKS=True,
+        CELERY_TASK_ALWAYS_EAGER=True,
+        OCR_MODE="auto",
+    )
+    @pytest.mark.usefixtures("fake_progress_manager")
+    def test_consume_file_link_failure_is_not_fatal(self) -> None:
+        """
+        GIVEN:
+            - PDF with a URL QR code
+            - Placing the links fails
+        WHEN:
+            - File is consumed
+        THEN:
+            - The document is still consumed, just without links
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+        dst = settings.SCRATCH_DIR / "barcode-qr-url.pdf"
+        shutil.copy(test_file, dst)
+
+        with mock.patch(
+            "documents.consumer.locate_barcodes",
+            side_effect=RuntimeError("broken"),
+        ):
+            tasks.consume_file(
+                ConsumableDocument(
+                    source=DocumentSource.ConsumeFolder,
+                    original_file=dst,
+                ),
+                None,
+            )
+
+        document = Document.objects.get()
+        self.assertTrue(document.has_archive_version)
+        self.assertEqual(self._link_annotations(document.archive_path, 1), [])
+
+    @override_settings(
+        CONSUMER_ENABLE_BARCODE_LINKS=True,
+        CONSUMER_STORE_BARCODE_VALUES=True,
+        CELERY_TASK_ALWAYS_EAGER=True,
+        OCR_MODE="auto",
+    )
+    @pytest.mark.usefixtures("fake_progress_manager")
+    def test_consume_version_links_archive(self) -> None:
+        """
+        GIVEN:
+            - A document with a URL QR code on page 2
+            - Barcode links and storing barcode values enabled
+        WHEN:
+            - A rotated copy is consumed as a new version, like after
+              rotating pages in the UI (versions skip the barcode plugin)
+        THEN:
+            - The archive file of the version links the QR code
+            - The version stores the barcodes with their position in its own
+              archive file
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+        dst = settings.SCRATCH_DIR / "barcode-qr-url.pdf"
+        shutil.copy(test_file, dst)
+        tasks.consume_file(
+            ConsumableDocument(source=DocumentSource.ConsumeFolder, original_file=dst),
+            None,
+        )
+        root = Document.objects.get()
+
+        version_file = settings.SCRATCH_DIR / "barcode-qr-url-rotated.pdf"
+        with Pdf.open(test_file) as pdf:
+            for page in pdf.pages:
+                page.rotate(90, relative=True)
+            pdf.save(version_file)
+        tasks.consume_file(
+            ConsumableDocument(
+                source=DocumentSource.ApiUpload,
+                original_file=version_file,
+                root_document_id=root.pk,
+            ),
+            None,
+        )
+
+        version = Document.objects.get(root_document=root)
+        self.assertTrue(version.has_archive_version)
+        links = self._link_annotations(version.archive_path, 1)
+        self.assertEqual(
+            [x[0] for x in links],
+            ["https://example.com/invoice/4711"],
+        )
+        stored = version.barcodes.get(page=2)
+        self.assertEqual(stored.value, "https://example.com/invoice/4711")
+        # the stored position is the one of the link in the version's archive
+        for stored_edge, link_edge in zip(stored.rect, links[0][1], strict=True):
+            self.assertAlmostEqual(stored_edge, link_edge, delta=1)
+
+
 class TestBarcodeValues(
     DirectoriesMixin,
     SampleDirMixin,
@@ -1142,6 +1491,84 @@ class TestBarcodeValues(
         {"page": 1, "value": "javascript:alert(1)", "format": "QR Code"},
         {"page": 2, "value": "https://example.com/invoice/4711", "format": "QR Code"},
     ]
+
+    # Area of the pasted QR image on each page of barcode-qr-url.pdf, in PDF points
+    QR_AREA = (403.2, 73.9, 547.2, 217.9)
+
+    def _assert_rect_over_qr(self, rect: list[float]) -> None:
+        self.assertIsNotNone(rect)
+        x0, y0, x1, y1 = self.QR_AREA
+        self.assertGreaterEqual(rect[0], x0)
+        self.assertGreaterEqual(rect[1], y0)
+        self.assertLessEqual(rect[2], x1)
+        self.assertLessEqual(rect[3], y1)
+        self.assertGreater(rect[2] - rect[0], 100)
+
+    def test_locate_barcodes(self) -> None:
+        """
+        GIVEN:
+            - PDF with a QR code on each of its two pages
+        WHEN:
+            - The barcodes are located, on all pages or on some
+        THEN:
+            - Each barcode is found with its page, value, format and position
+        """
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-url.pdf"
+
+        located = locate_barcodes(
+            test_file,
+            None,
+            BarcodeConfig(),
+            self.dirs.scratch_dir,
+        )
+
+        self.assertEqual(
+            [(x.page, x.value, x.format) for x in located],
+            [
+                (0, "javascript:alert(1)", "QR Code"),
+                (1, "https://example.com/invoice/4711", "QR Code"),
+            ],
+        )
+        for barcode in located:
+            self._assert_rect_over_qr(barcode.rect)
+
+        located = locate_barcodes(
+            test_file,
+            [1, 7],
+            BarcodeConfig(),
+            self.dirs.scratch_dir,
+        )
+        self.assertEqual([x.page for x in located], [1])
+
+    def test_attach_barcode_rects(self) -> None:
+        """
+        GIVEN:
+            - Stored barcodes, including the same value twice on a page
+            - Located barcodes, missing one of them
+        WHEN:
+            - Positions are attached
+        THEN:
+            - Each located barcode is used once, by page and value
+            - A barcode not located again has no position
+        """
+        stored = [
+            {"page": 1, "value": "A", "format": "QR Code"},
+            {"page": 1, "value": "A", "format": "QR Code"},
+            {"page": 2, "value": "A", "format": "QR Code"},
+            {"page": 2, "value": "B", "format": "QR Code"},
+        ]
+        located = [
+            LocatedBarcode(0, "A", "QR Code", (1.0, 2.0, 3.0, 4.0)),
+            LocatedBarcode(0, "A", "QR Code", (5.0, 6.0, 7.0, 8.0)),
+            LocatedBarcode(1, "B", "QR Code", (1.234, 2.0, 3.0, 4.0)),
+        ]
+
+        result = attach_barcode_rects(stored, located)
+
+        self.assertEqual(
+            [x["rect"] for x in result],
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], None, [1.23, 2.0, 3.0, 4.0]],
+        )
 
     @override_settings(CONSUMER_STORE_BARCODE_VALUES=True)
     def test_values_detected(self) -> None:
@@ -1218,7 +1645,13 @@ class TestBarcodeValues(
         response = client.get(f"/api/documents/{document.pk}/metadata/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         barcodes = response.data["barcodes"]
-        self.assertEqual(barcodes, self.SAMPLE_VALUES)
+        self.assertEqual(
+            [{k: x[k] for k in ("page", "value", "format")} for x in barcodes],
+            self.SAMPLE_VALUES,
+        )
+        # positions in the shown (archive) file, over the pasted QR images
+        for barcode in barcodes:
+            self._assert_rect_over_qr(barcode["rect"])
 
         # also part of the document itself, and searchable by content
         response = client.get(f"/api/documents/{document.pk}/")

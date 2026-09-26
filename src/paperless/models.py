@@ -303,6 +303,12 @@ class ApplicationConfiguration(AbstractSingletonModel):
         null=True,
     )
 
+    # PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS
+    barcode_enable_links = models.BooleanField(
+        verbose_name=_("Enables clickable links for URL barcodes"),
+        null=True,
+    )
+
     # PAPERLESS_CONSUMER_STORE_BARCODE_VALUES
     barcode_store_values = models.BooleanField(
         verbose_name=_("Stores the values of detected barcodes"),

@@ -18,7 +18,11 @@ from django.utils import timezone
 from filelock import FileLock
 from rest_framework.reverse import reverse
 
+from documents.barcodes import attach_barcode_rects
+from documents.barcodes import is_link_url
+from documents.barcodes import locate_barcodes
 from documents.barcodes import read_barcode_values
+from documents.barcodes import write_barcode_links
 from documents.classifier import load_classifier
 from documents.data_models import ConsumableDocument
 from documents.data_models import ConsumeFileSuccessResult
@@ -290,6 +294,75 @@ class ConsumerPlugin(
             version_doc.version_label = self.metadata.version_label
         return version_doc
 
+    def _read_version_barcodes(self, work_dir: Path) -> None:
+        barcode_settings = BarcodeConfig()
+        store = barcode_settings.barcode_store_values and self.metadata.barcodes is None
+        links = (
+            barcode_settings.barcode_enable_links
+            and self.metadata.barcode_link_pages is None
+        )
+        if not store and not links:
+            return
+        values = read_barcode_values(self.working_copy, work_dir, self.task_id)
+        if store:
+            self.metadata.barcodes = values or None
+        if links:
+            self.metadata.barcode_link_pages = (
+                sorted({x["page"] - 1 for x in values if is_link_url(x["value"])})
+                or None
+            )
+
+    def _process_barcodes(
+        self,
+        archive_path: Path | None,
+        mime_type: str,
+        work_dir: Path,
+    ) -> None:
+        """
+        Locates the barcodes in the file shown to users (the archive file if
+        there is one), to make URL barcodes clickable in the archive file and
+        to remember where the stored barcodes are. A failure here only costs
+        the links or positions, never the document.
+        """
+        barcode_settings = BarcodeConfig()
+        link_pages = (
+            set(self.metadata.barcode_link_pages or [])
+            if barcode_settings.barcode_enable_links and archive_path
+            else set()
+        )
+        stored = (
+            self.metadata.barcodes if barcode_settings.barcode_store_values else None
+        )
+        if archive_path:
+            shown_path = archive_path
+        elif mime_type == "application/pdf":
+            shown_path = self.working_copy
+        else:
+            shown_path = None
+        if not link_pages and not (stored and shown_path):
+            return
+        try:
+            pages = set(link_pages)
+            if stored and shown_path:
+                pages.update(x["page"] - 1 for x in stored)
+            located = locate_barcodes(
+                shown_path,
+                sorted(pages),
+                barcode_settings,
+                work_dir,
+            )
+            if link_pages:
+                count = write_barcode_links(
+                    archive_path,
+                    [x for x in located if x.page in link_pages],
+                )
+                if count:
+                    self.log.info(f"Added {count} barcode link(s) to the archive file")
+            if stored and shown_path:
+                self.metadata.barcodes = attach_barcode_rects(stored, located)
+        except Exception as e:
+            self.log.warning(f"Could not process barcodes of {self.filename}: {e}")
+
     def run_pre_consume_script(self) -> None:
         """
         If one is configured and exists, run the pre-consume script and
@@ -509,19 +582,8 @@ class ConsumerPlugin(
 
                 # New versions skip the barcode plugin, so their barcodes are
                 # read here, without splitting or ASN handling
-                if (
-                    self.input_doc.root_document_id is not None
-                    and self.metadata.barcodes is None
-                    and BarcodeConfig().barcode_store_values
-                ):
-                    self.metadata.barcodes = (
-                        read_barcode_values(
-                            self.working_copy,
-                            Path(tmpdir),
-                            self.task_id,
-                        )
-                        or None
-                    )
+                if self.input_doc.root_document_id is not None:
+                    self._read_version_barcodes(Path(tmpdir))
 
                 # Parse the document. This may take some time.
 
@@ -576,6 +638,12 @@ class ConsumerPlugin(
                         with get_date_parser() as date_parser:
                             date = next(date_parser.parse(self.filename, text), None)
                     archive_path = document_parser.get_archive_path()
+                    if self.metadata.barcode_link_pages or self.metadata.barcodes:
+                        self._process_barcodes(
+                            Path(archive_path) if archive_path else None,
+                            mime_type,
+                            Path(tmpdir),
+                        )
                     page_count = document_parser.get_page_count(
                         self.working_copy,
                         mime_type,

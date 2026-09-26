@@ -1008,6 +1008,25 @@ documents to both separate and categorize them in a single operation.
 **Example:** A 6-page scan with TAG:invoice on page 3 and TAG:receipt on page 5 will create
 three documents: pages 1-2 (no tags), pages 3-4 (tagged "invoice"), and pages 5-6 (tagged "receipt").
 
+### Barcode Links {#barcode-links}
+
+When [`PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS`](configuration.md#PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS)
+is enabled, barcodes containing a web address become clickable. Many letters, invoices and
+forms carry a QR code pointing to an online portal, a payment page or further information;
+with this setting, clicking the code in the document viewer opens that address.
+
+- Only absolute `http://` and `https://` addresses are linked. Other contents, for example
+  `javascript:` or `file:`, are ignored.
+- The link is added to the **archive version** of the document as a standard PDF link
+  annotation. It works in the Paperless-ngx viewer and in any other PDF viewer after
+  downloading the archive version. The archive file remains valid PDF/A.
+- The original file is never modified. Documents without an archive version are not linked.
+  With the default [`PAPERLESS_ARCHIVE_FILE_GENERATION=auto`](configuration.md#PAPERLESS_ARCHIVE_FILE_GENERATION),
+  this applies to born-digital PDFs which already contain text; set it to `always` to link those as well.
+- The barcode is located again in the finished archive file, so the link stays in place even if
+  OCR rotated or deskewed the page.
+- Reprocessing a document creates a new archive file, and the links are placed again.
+
 ### Barcode Contents {#barcode-contents}
 
 When scanning for barcodes, Paperless reads every barcode on a document, but by default only
@@ -1016,7 +1035,9 @@ uses those needed for splitting, ASNs or tags. When
 is enabled, the content of all barcodes is stored with the document instead, for example
 payment codes, customer numbers or the text of a QR code.
 
-- The barcodes are listed on the **Metadata** tab of the document details with their page,
+- In the built-in PDF viewer, hovering over a barcode shows a **Copy** button in its corner,
+  and web addresses can be opened by clicking the barcode.
+- The barcodes are also listed on the **Metadata** tab of the document details with their page,
   type and content. A button copies the content to the clipboard, and web addresses can be
   opened directly.
 - The barcodes are part of the document in the API (field `barcodes` of `/api/documents/`
@@ -1025,7 +1046,8 @@ payment codes, customer numbers or the text of a QR code.
   the API with `/api/documents/?query=barcodes:DE8937…`.
 - The barcodes are read from the original file during consumption, subject to
   [`PAPERLESS_CONSUMER_BARCODE_MAX_PAGES`](configuration.md#PAPERLESS_CONSUMER_BARCODE_MAX_PAGES).
-  Documents consumed before the setting was enabled get their barcodes when they are
+  Their position is taken from the file shown in the viewer, i.e. the archive version if there
+  is one. Documents consumed before the setting was enabled get their barcodes when they are
   reprocessed.
 - Each version of a document keeps its own barcodes, e.g. after rotating or removing pages.
   The document shows and is searched by the barcodes of its newest version.

@@ -35,6 +35,9 @@ class DocumentMetadataOverrides:
     version_label: str | None = None
     actor_id: int | None = None
     remote_ocr: bool = False
+    # Pages (0-indexed) of the original with URL barcodes, filled by the
+    # barcode plugin to link them in the archive file
+    barcode_link_pages: list[int] | None = None
     # Detected barcodes to store with the document, filled by the barcode
     # plugin: dicts with page (1-indexed), value and format
     barcodes: list[dict] | None = None

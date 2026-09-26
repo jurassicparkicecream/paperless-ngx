@@ -852,6 +852,10 @@ class EmailDocumentDetailSchema(EmailSerializer):
                                 "page": serializers.IntegerField(),
                                 "value": serializers.CharField(),
                                 "format": serializers.CharField(),
+                                "rect": serializers.ListField(
+                                    child=serializers.FloatField(),
+                                    allow_null=True,
+                                ),
                             },
                         ),
                     ),
@@ -1535,7 +1539,9 @@ class DocumentViewSet(
             "original_filename": doc.original_filename,
             "archive_size": archive_filesize,
             "archive_metadata": archive_metadata,
-            "barcodes": list(doc.barcodes.values("page", "value", "format")),
+            "barcodes": list(
+                doc.barcodes.values("page", "value", "format", "rect"),
+            ),
         }
 
         lang = "en"

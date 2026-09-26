@@ -489,6 +489,7 @@
               [page]="previewCurrentPage()" (pageChange)="previewCurrentPage.set($event)"
               [zoomScale]="previewZoomScale()"
               [zoom]="previewZoomSetting()"
+              [barcodes]="metadata()?.barcodes"
               (loadError)="onError($event)"
               (afterLoadComplete)="pdfPreviewLoaded($event)">
             </pngx-pdf-viewer>

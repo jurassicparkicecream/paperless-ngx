@@ -1,3 +1,4 @@
+import { Clipboard } from '@angular/cdk/clipboard'
 import {
   AfterViewInit,
   Component,
@@ -27,6 +28,7 @@ import {
   PDFSinglePageViewer,
   PDFViewer,
 } from 'pdfjs-dist/web/pdf_viewer.mjs'
+import { DocumentBarcode } from 'src/app/data/document-barcode'
 import {
   PdfRenderMode,
   PdfZoomLevel,
@@ -55,6 +57,8 @@ export class PngxPdfViewerComponent
   @Input() searchQuery = ''
   @Input() zoom: PdfZoomLevel = PdfZoomLevel.One
   @Input() zoomScale: PdfZoomScale = PdfZoomScale.PageWidth
+  // Barcodes with their position, shown with a copy button on hover
+  @Input() barcodes: DocumentBarcode[] = []
 
   @Output() afterLoadComplete = new EventEmitter<PngxPdfDocumentProxy>()
   @Output() rendered = new EventEmitter<void>()
@@ -87,7 +91,11 @@ export class PngxPdfViewerComponent
     updateMatchesCountOnProgress: false,
   })
 
-  private readonly onPageRendered = () => {
+  private readonly clipboard = inject(Clipboard)
+  private readonly copyTimeouts = new Set<ReturnType<typeof setTimeout>>()
+
+  private readonly onPageRendered = (evt?: { source?: BarcodePageView }) => {
+    this.renderBarcodeLayer(evt?.source)
     this.hasRenderedPage = true
     this.dispatchFindIfReady()
     this.rendered.emit()
@@ -131,6 +139,10 @@ export class PngxPdfViewerComponent
     if (changes['searchQuery']) {
       this.dispatchFindIfReady()
     }
+
+    if (changes['barcodes']) {
+      this.renderAllBarcodeLayers()
+    }
   }
 
   ngAfterViewInit(): void {
@@ -150,6 +162,7 @@ export class PngxPdfViewerComponent
     this.eventBus.off('pagesinit', this.onPagesInit)
     this.eventBus.off('pagechanging', this.onPageChanging)
     this.resizeObserver?.disconnect()
+    this.copyTimeouts.forEach((timeout) => clearTimeout(timeout))
     this.loadingTask?.destroy()
     this.pdfViewer?.cleanup()
     this.pdfViewer = undefined
@@ -310,5 +323,102 @@ export class PngxPdfViewerComponent
       highlightAll: query?.length > 0,
       phraseSearch: true,
     })
+  }
+
+  private renderAllBarcodeLayers(): void {
+    const viewer = this.pdfViewer as unknown as {
+      pagesCount: number
+      getPageView?: (index: number) => BarcodePageView
+    }
+    if (!viewer?.getPageView) {
+      return
+    }
+    for (let index = 0; index < viewer.pagesCount; index++) {
+      this.renderBarcodeLayer(viewer.getPageView(index))
+    }
+  }
+
+  private renderBarcodeLayer(pageView?: BarcodePageView): void {
+    if (!pageView?.div || !pageView.viewport) {
+      return
+    }
+    pageView.div.querySelector(':scope > .barcodeLayer')?.remove()
+    const barcodes = (this.barcodes ?? []).filter(
+      (barcode) => barcode.page === pageView.id && barcode.rect?.length === 4
+    )
+    if (!barcodes.length) {
+      return
+    }
+
+    const document = pageView.div.ownerDocument
+    const { viewport } = pageView
+    const layer = document.createElement('div')
+    layer.className = 'barcodeLayer'
+
+    for (const barcode of barcodes) {
+      const [x0, y0, x1, y1] = barcode.rect
+      const [ax, ay] = viewport.convertToViewportPoint(x0, y0)
+      const [bx, by] = viewport.convertToViewportPoint(x1, y1)
+      // Relative to the page, so the layer follows zoom changes until the
+      // page is rendered again
+      const region = document.createElement('div')
+      region.className = 'barcode-region'
+      region.title = barcode.value
+      region.style.left = `${(Math.min(ax, bx) / viewport.width) * 100}%`
+      region.style.top = `${(Math.min(ay, by) / viewport.height) * 100}%`
+      region.style.width = `${(Math.abs(bx - ax) / viewport.width) * 100}%`
+      region.style.height = `${(Math.abs(by - ay) / viewport.height) * 100}%`
+
+      if (isLinkValue(barcode.value)) {
+        const link = document.createElement('a')
+        link.className = 'barcode-link'
+        link.href = barcode.value.trim()
+        link.target = '_blank'
+        link.rel = 'noopener noreferrer nofollow'
+        region.appendChild(link)
+      }
+
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'barcode-copy btn btn-sm'
+      button.textContent = $localize`Copy`
+      button.setAttribute('aria-label', $localize`Copy barcode content`)
+      button.addEventListener('click', (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        if (!this.clipboard.copy(barcode.value)) {
+          return
+        }
+        button.textContent = $localize`Copied!`
+        const timeout = setTimeout(() => {
+          button.textContent = $localize`Copy`
+          this.copyTimeouts.delete(timeout)
+        }, 2000)
+        this.copyTimeouts.add(timeout)
+      })
+      region.appendChild(button)
+      layer.appendChild(region)
+    }
+
+    pageView.div.appendChild(layer)
+  }
+}
+
+interface BarcodePageView {
+  id: number
+  div?: HTMLElement
+  viewport?: {
+    width: number
+    height: number
+    convertToViewportPoint: (x: number, y: number) => number[]
+  }
+}
+
+function isLinkValue(value: string): boolean {
+  try {
+    const url = new URL(value.trim())
+    return ['http:', 'https:'].includes(url.protocol) && !!url.host
+  } catch {
+    return false
   }
 }

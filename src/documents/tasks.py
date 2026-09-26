@@ -20,7 +20,10 @@ from filelock import FileLock
 
 from documents import sanity_checker
 from documents.barcodes import BarcodePlugin
+from documents.barcodes import attach_barcode_rects
+from documents.barcodes import locate_barcodes
 from documents.barcodes import read_barcode_values
+from documents.barcodes import write_barcode_links
 from documents.bulk_download import ArchiveOnlyStrategy
 from documents.bulk_download import OriginalsOnlyStrategy
 from documents.caching import clear_document_caches
@@ -344,22 +347,58 @@ def bulk_update_documents(document_ids) -> None:
         )
 
 
-def _maybe_update_stored_barcodes(document: Document) -> None:
+def _process_barcodes_after_reprocess(
+    archive_path: Path | None,
+    document: Document,
+) -> None:
     """
-    Reads the barcodes of the original again and replaces the stored ones,
-    e.g. for documents consumed before storing barcodes was enabled
+    Re-creating the archive file drops the barcode links and may move the
+    barcodes, so they are linked and located again. Without the data from
+    consumption, all pages are checked. The stored barcodes are read again
+    from the original, e.g. for documents consumed before storing them was
+    enabled.
     """
-    if not BarcodeConfig().barcode_store_values:
+    barcode_settings = BarcodeConfig()
+    if archive_path and not Path(archive_path).is_file():
+        archive_path = None
+    do_links = barcode_settings.barcode_enable_links and archive_path is not None
+    do_store = barcode_settings.barcode_store_values
+    if not do_links and not do_store:
         return
     try:
         with TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmpdir:
-            values = read_barcode_values(
-                document.source_path,
-                Path(tmpdir),
-                f"barcodes-{document.pk}",
-            )
+            values = None
+            if do_store:
+                values = read_barcode_values(
+                    document.source_path,
+                    Path(tmpdir),
+                    f"barcodes-{document.pk}",
+                )
 
-        if values == list(document.barcodes.values("page", "value", "format")):
+            if archive_path:
+                shown_path = Path(archive_path)
+            elif document.mime_type == "application/pdf":
+                shown_path = document.source_path
+            else:
+                shown_path = None
+
+            located = []
+            if shown_path and (do_links or values):
+                located = locate_barcodes(
+                    shown_path,
+                    None if do_links else sorted({x["page"] - 1 for x in values}),
+                    barcode_settings,
+                    Path(tmpdir),
+                )
+            if do_links:
+                count = write_barcode_links(Path(archive_path), located)
+                if count:
+                    logger.info(f"Added {count} barcode link(s) to document {document}")
+
+        if values is None:
+            return
+        values = attach_barcode_rects(values, located)
+        if values == list(document.barcodes.values("page", "value", "format", "rect")):
             return
         with transaction.atomic():
             document.barcodes.all().delete()
@@ -369,7 +408,7 @@ def _maybe_update_stored_barcodes(document: Document) -> None:
             # the metadata response is cached by modification time
             Document.objects.filter(pk=document.pk).update(modified=timezone.now())
     except Exception as e:
-        logger.warning(f"Could not read barcodes of document {document}: {e}")
+        logger.warning(f"Could not process barcodes of document {document}: {e}")
 
 
 @shared_task
@@ -418,7 +457,7 @@ def update_document_content_maybe_archive_file(
                 produce_archive=produce_archive,
             )
 
-            _maybe_update_stored_barcodes(document)
+            _process_barcodes_after_reprocess(parser.get_archive_path(), document)
 
             thumbnail = parser.get_thumbnail(document.source_path, mime_type)
 

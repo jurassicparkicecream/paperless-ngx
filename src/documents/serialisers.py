@@ -991,7 +991,7 @@ class BasicUserSerializer(serializers.ModelSerializer[User]):
 class DocumentBarcodeSerializer(serializers.ModelSerializer[DocumentBarcode]):
     class Meta:
         model = DocumentBarcode
-        fields = ["page", "value", "format"]
+        fields = ["page", "value", "format", "rect"]
 
 
 class NotesSerializer(serializers.ModelSerializer[Note]):

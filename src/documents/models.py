@@ -1022,6 +1022,16 @@ class DocumentBarcode(models.Model):
 
     format = models.CharField(_("format"), max_length=64, blank=True)
 
+    rect = models.JSONField(
+        _("position"),
+        null=True,
+        blank=True,
+        help_text=_(
+            "Rectangle [x0, y0, x1, y1] in PDF coordinates of the page as shown, "
+            "i.e. in the archive file if there is one",
+        ),
+    )
+
     class Meta:
         ordering = ("page", "id")
         verbose_name = _("document barcode")

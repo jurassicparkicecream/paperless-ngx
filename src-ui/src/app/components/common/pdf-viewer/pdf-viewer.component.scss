@@ -180,3 +180,51 @@
 :host ::ng-deep .textLayer.selecting ~ .annotationLayer section {
   pointer-events: none;
 }
+
+// Barcodes stored with the document: a copy button appears on hover
+:host ::ng-deep .barcodeLayer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+
+  & .barcode-region {
+    position: absolute;
+    pointer-events: auto;
+  }
+
+  & .barcode-region:hover {
+    background-color: rgb(255 255 0 / 0.2);
+  }
+
+  & .barcode-link {
+    position: absolute;
+    inset: 0;
+  }
+
+  & .barcode-copy {
+    position: absolute;
+    top: 0.25rem;
+    right: 0.25rem;
+    padding: 0 0.4rem;
+    font-size: 0.75rem;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    // A darker shade of the accent colour, readable in light and dark mode
+    // on top of the (usually white) page
+    color: var(--pngx-primary-text-contrast);
+    background-color: var(--pngx-primary-darken-5);
+    border-color: var(--pngx-primary-darken-5);
+
+    &:hover {
+      color: var(--pngx-primary-text-contrast);
+      background-color: var(--pngx-primary-darken-15);
+      border-color: var(--pngx-primary-darken-15);
+    }
+  }
+
+  & .barcode-region:hover .barcode-copy,
+  & .barcode-copy:focus-visible {
+    opacity: 1;
+  }
+}

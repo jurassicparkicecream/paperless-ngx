@@ -6,13 +6,18 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import regex as regex_mod
 from django.conf import settings
 from pdf2image import convert_from_path
+from pikepdf import Array
+from pikepdf import Dictionary
+from pikepdf import Name
 from pikepdf import Page
 from pikepdf import PasswordError
 from pikepdf import Pdf
+from pikepdf import String
 
 from documents.converters import convert_from_tiff_to_pdf
 from documents.data_models import ConsumableDocument
@@ -36,6 +41,18 @@ if TYPE_CHECKING:
     from PIL import Image
 
 logger = logging.getLogger("paperless.barcodes")
+
+
+def is_link_url(value: str) -> bool:
+    """
+    Only absolute http(s) URLs are turned into links, other schemes such as
+    javascript: or file: are never linked
+    """
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,14 @@ class Barcode:
         False otherwise
         """
         return self.value.startswith(self.settings.barcode_asn_prefix)
+
+    @property
+    def is_link(self) -> bool:
+        """
+        Returns True if the barcode value is an absolute http(s) URL,
+        False otherwise
+        """
+        return is_link_url(self.value)
 
     @property
     def is_tag(self) -> bool:
@@ -99,6 +124,7 @@ class BarcodePlugin(ConsumeTaskPlugin):
             self.settings.barcode_enable_asn
             or self.settings.barcodes_enabled
             or self.settings.barcode_enable_tag
+            or self.settings.barcode_enable_links
             or self.settings.barcode_store_values
         ) and self.input_doc.mime_type in supported_mimes
 
@@ -246,7 +272,14 @@ class BarcodePlugin(ConsumeTaskPlugin):
         if self.settings.barcode_enable_asn and (located_asn := self.asn) is not None:
             self._apply_detected_asn(located_asn)
 
-        # After splitting too, so each split document keeps its own barcodes
+        # Remember the pages with URL barcodes, after splitting for the same
+        # reason. The links are placed once the archive file exists.
+        if self.settings.barcode_enable_links:
+            link_pages = sorted({x.page for x in self.barcodes if x.is_link})
+            self.metadata.barcode_link_pages = link_pages or None
+            if link_pages:
+                logger.info(f"Found URL barcodes on pages: {link_pages}")
+
         if self.settings.barcode_store_values:
             self.metadata.barcodes = self.barcode_values or None
 
@@ -581,3 +614,193 @@ def read_barcode_values(path: Path, work_dir: Path, task_id: str) -> list[dict]:
         return reader.barcode_values
     finally:
         reader.cleanup()
+
+
+def _visual_to_pdf_point(
+    x: float,
+    y: float,
+    box: tuple[float, float, float, float],
+    rotate: int,
+) -> tuple[float, float]:
+    """
+    Maps a point given relative to the page as displayed (0..1, origin top
+    left, /Rotate applied) to PDF user space
+    """
+    x0, y0, x1, y1 = box
+    width = x1 - x0
+    height = y1 - y0
+    if rotate == 90:
+        return x0 + y * width, y0 + x * height
+    if rotate == 180:
+        return x1 - x * width, y0 + y * height
+    if rotate == 270:
+        return x1 - y * width, y1 - x * height
+    return x0 + x * width, y1 - y * height
+
+
+@dataclass(frozen=True)
+class LocatedBarcode:
+    """
+    A barcode and the rectangle it covers, in PDF user space of its page
+    """
+
+    page: int  # 0-indexed
+    value: str
+    format: str
+    rect: tuple[float, float, float, float]
+
+
+def locate_barcodes(
+    pdf_path: Path,
+    pages: list[int] | None,
+    settings: BarcodeConfig,
+    work_dir: Path,
+) -> list[LocatedBarcode]:
+    """
+    Finds the barcodes on the given pages (0-indexed, all pages if None) of
+    the PDF and where they are.
+
+    Callers pass the file shown to users, e.g. the archive file, as OCR may
+    have rotated or deskewed its pages compared to the original.
+    """
+    import zxingcpp
+
+    located: list[LocatedBarcode] = []
+    with Pdf.open(pdf_path) as pdf:
+        num_of_pages = len(pdf.pages)
+        if pages is None:
+            pages = list(range(num_of_pages))
+        if settings.barcode_max_pages:
+            pages = [x for x in pages if x < settings.barcode_max_pages]
+
+        for page_number in sorted(set(pages)):
+            if page_number >= num_of_pages:
+                continue
+            image = convert_from_path(
+                pdf_path,
+                dpi=settings.barcode_dpi,
+                output_folder=work_dir,
+                first_page=page_number + 1,
+                last_page=page_number + 1,
+            )[0]
+            image_path = Path(image.filename)
+            factor = settings.barcode_upscale
+            if factor > 1.0:
+                x, y = image.size
+                image = image.resize((round(x * factor), round(y * factor)))
+            width, height = image.size
+
+            page = pdf.pages[page_number]
+            rotate = int(page.obj.get("/Rotate", 0)) % 360
+            box = tuple(float(x) for x in page.mediabox)
+
+            for barcode in zxingcpp.read_barcodes(image):
+                if not barcode.text:
+                    continue
+                corners = (
+                    barcode.position.top_left,
+                    barcode.position.top_right,
+                    barcode.position.bottom_right,
+                    barcode.position.bottom_left,
+                )
+                points = [
+                    _visual_to_pdf_point(c.x / width, c.y / height, box, rotate)
+                    for c in corners
+                ]
+                located.append(
+                    LocatedBarcode(
+                        page=page_number,
+                        value=barcode.text,
+                        format=str(barcode.format),
+                        rect=(
+                            min(p[0] for p in points),
+                            min(p[1] for p in points),
+                            max(p[0] for p in points),
+                            max(p[1] for p in points),
+                        ),
+                    ),
+                )
+
+            image_path.unlink(missing_ok=True)
+
+    return located
+
+
+def write_barcode_links(pdf_path: Path, located: list[LocatedBarcode]) -> int:
+    """
+    Places a clickable link over every located URL barcode, modifying the
+    file in place. Returns the number of links added.
+    """
+    links = [x for x in located if is_link_url(x.value)]
+    if not links:
+        return 0
+
+    with Pdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        for barcode in links:
+            page = pdf.pages[barcode.page]
+            # /F 4 (print) and no border keep the file valid PDF/A
+            annotation = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Link,
+                    Rect=Array(list(barcode.rect)),
+                    Border=Array([0, 0, 0]),
+                    F=4,
+                    A=Dictionary(S=Name.URI, URI=String(barcode.value.strip())),
+                ),
+            )
+            if "/Annots" not in page.obj:
+                page.obj.Annots = pdf.make_indirect(Array())
+            page.obj.Annots.append(annotation)
+            logger.debug(f"Linked barcode {barcode.value} on page {barcode.page}")
+        pdf.save(pdf_path)
+
+    return len(links)
+
+
+def add_barcode_links(
+    pdf_path: Path,
+    pages: list[int] | None,
+    settings: BarcodeConfig,
+    work_dir: Path,
+) -> int:
+    """
+    Places a clickable link over every URL barcode found on the given pages
+    (0-indexed, all pages if None) of the PDF, modifying the file in place.
+
+    Returns the number of links added.
+    """
+    return write_barcode_links(
+        pdf_path,
+        locate_barcodes(pdf_path, pages, settings, work_dir),
+    )
+
+
+def attach_barcode_rects(
+    barcodes: list[dict],
+    located: list[LocatedBarcode],
+) -> list[dict]:
+    """
+    Adds the rectangle of the matching located barcode (same page and value)
+    to each stored barcode, or None if it was not found again
+    """
+    remaining = list(located)
+    result = []
+    for barcode in barcodes:
+        match = next(
+            (
+                x
+                for x in remaining
+                if x.page == barcode["page"] - 1 and x.value == barcode["value"]
+            ),
+            None,
+        )
+        if match is not None:
+            remaining.remove(match)
+        result.append(
+            {
+                **barcode,
+                "rect": [round(x, 2) for x in match.rect] if match else None,
+            },
+        )
+    return result

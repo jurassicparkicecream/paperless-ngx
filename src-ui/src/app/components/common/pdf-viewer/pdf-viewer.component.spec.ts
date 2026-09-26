@@ -41,6 +41,130 @@ describe('PngxPdfViewerComponent', () => {
     setBaseHref('/')
   })
 
+  describe('barcode layer', () => {
+    const makePageView = (id = 1) => {
+      const div = document.createElement('div')
+      return {
+        id,
+        div,
+        viewport: {
+          width: 200,
+          height: 400,
+          // PDF points at scale 1, y axis pointing down
+          convertToViewportPoint: (x: number, y: number) => [x, 400 - y],
+        },
+      }
+    }
+    const barcodes = [
+      {
+        page: 1,
+        value: 'https://example.com/invoice/4711',
+        format: 'QR Code',
+        rect: [100, 300, 150, 350],
+      },
+      {
+        page: 1,
+        value: 'ASN00123',
+        format: 'Code 128',
+        rect: [10, 10, 60, 30],
+      },
+      { page: 2, value: 'OTHER PAGE', format: 'QR Code', rect: [0, 0, 1, 1] },
+      { page: 1, value: 'NO POSITION', format: 'QR Code', rect: null },
+    ]
+
+    it('places a region over each positioned barcode of the page', () => {
+      component.barcodes = barcodes
+      const pageView = makePageView()
+      component['renderBarcodeLayer'](pageView)
+
+      const regions = pageView.div.querySelectorAll('.barcode-region')
+      expect(regions.length).toEqual(2)
+      const first = regions[0] as HTMLElement
+      expect(first.style.left).toEqual('50%')
+      expect(first.style.top).toEqual('12.5%')
+      expect(first.style.width).toEqual('25%')
+      expect(first.style.height).toEqual('12.5%')
+      expect(first.title).toEqual('https://example.com/invoice/4711')
+    })
+
+    it('links only http(s) barcodes', () => {
+      component.barcodes = barcodes
+      const pageView = makePageView()
+      component['renderBarcodeLayer'](pageView)
+
+      const links = pageView.div.querySelectorAll('a.barcode-link')
+      expect(links.length).toEqual(1)
+      expect(links[0].getAttribute('href')).toEqual(
+        'https://example.com/invoice/4711'
+      )
+      expect(links[0].getAttribute('target')).toEqual('_blank')
+    })
+
+    it('replaces the layer when rendered again and skips pages without barcodes', () => {
+      component.barcodes = barcodes
+      const pageView = makePageView()
+      component['renderBarcodeLayer'](pageView)
+      component['renderBarcodeLayer'](pageView)
+      expect(pageView.div.querySelectorAll('.barcodeLayer').length).toEqual(1)
+
+      const emptyPage = makePageView(3)
+      component['renderBarcodeLayer'](emptyPage)
+      expect(emptyPage.div.querySelector('.barcodeLayer')).toBeNull()
+
+      component['renderBarcodeLayer'](undefined)
+    })
+
+    it('copies the content and shows feedback', () => {
+      jest.useFakeTimers()
+      const copySpy = jest
+        .spyOn(component['clipboard'], 'copy')
+        .mockReturnValue(true)
+      component.barcodes = barcodes
+      const pageView = makePageView()
+      component['renderBarcodeLayer'](pageView)
+
+      const button = pageView.div.querySelectorAll(
+        '.barcode-copy'
+      )[1] as HTMLButtonElement
+      button.click()
+      expect(copySpy).toHaveBeenCalledWith('ASN00123')
+      expect(button.textContent).toEqual('Copied!')
+      jest.advanceTimersByTime(2000)
+      expect(button.textContent).toEqual('Copy')
+
+      copySpy.mockReturnValue(false)
+      button.click()
+      expect(button.textContent).toEqual('Copy')
+      jest.useRealTimers()
+    })
+
+    it('renders the layers of all pages when the barcodes change', () => {
+      const pageViews = [makePageView(1), makePageView(2)]
+      component['pdfViewer'] = {
+        pagesCount: 2,
+        getPageView: (index: number) => pageViews[index],
+      } as any
+      component.barcodes = barcodes
+      component.ngOnChanges({
+        barcodes: new SimpleChange(undefined, barcodes, false),
+      })
+      expect(pageViews[0].div.querySelector('.barcodeLayer')).not.toBeNull()
+      expect(pageViews[1].div.querySelector('.barcodeLayer')).not.toBeNull()
+
+      component['pdfViewer'] = undefined
+      component.ngOnChanges({
+        barcodes: new SimpleChange(undefined, [], false),
+      })
+    })
+
+    it('renders the layer when a page is rendered', () => {
+      component.barcodes = barcodes
+      const pageView = makePageView()
+      component['onPageRendered']({ source: pageView })
+      expect(pageView.div.querySelector('.barcodeLayer')).not.toBeNull()
+    })
+  })
+
   it('loads a document and emits events', async () => {
     const loadSpy = jest.fn()
     const renderedSpy = jest.fn()

@@ -1796,13 +1796,27 @@ assigns or creates tags if a properly formatted barcode is detected.
 
     Defaults to false.
 
+#### [`PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS=<bool>`](#PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS) {#PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS}
+
+: Makes barcodes containing a web address (`http://` or `https://`) clickable
+in the archive version of a document.
+
+    The link is placed exactly over the barcode, so clicking the QR code in the
+    document viewer opens the address in a new tab. The original file is never
+    modified, and documents without an archive version are not linked.
+
+    See [Barcode Links](advanced_usage.md#barcode-links) for details.
+
+    Defaults to false.
+
 #### [`PAPERLESS_CONSUMER_STORE_BARCODE_VALUES=<bool>`](#PAPERLESS_CONSUMER_STORE_BARCODE_VALUES) {#PAPERLESS_CONSUMER_STORE_BARCODE_VALUES}
 
 : Stores the content of every barcode found during consumption with the
 document, together with its page and type.
 
-    The barcodes are listed on the Metadata tab of the document details,
-    where their content can be copied. See
+    In the built-in PDF viewer, hovering over a barcode shows a button to copy
+    its content. The barcodes are also listed on the Metadata tab of the
+    document details. See
     [Barcode Contents](advanced_usage.md#barcode-contents) for details.
 
     Defaults to false.

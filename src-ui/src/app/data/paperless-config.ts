@@ -331,6 +331,13 @@ export const PaperlessConfigOptions: ConfigOption[] = [
     category: ConfigCategory.Barcode,
   },
   {
+    key: 'barcode_enable_links',
+    title: $localize`Enable Barcode Links`,
+    type: ConfigOptionType.Boolean,
+    config_key: 'PAPERLESS_CONSUMER_ENABLE_BARCODE_LINKS',
+    category: ConfigCategory.Barcode,
+  },
+  {
     key: 'barcode_store_values',
     title: $localize`Store Barcode Contents`,
     type: ConfigOptionType.Boolean,
@@ -465,6 +472,7 @@ export interface PaperlessConfig extends ObjectWithId {
   barcode_enable_tag: boolean
   barcode_tag_mapping: object
   barcode_tag_split: boolean
+  barcode_enable_links: boolean
   barcode_store_values: boolean
   remote_ocr_engine: string
   remote_ocr_api_key: string
